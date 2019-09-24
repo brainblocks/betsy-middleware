@@ -30,12 +30,15 @@ parser.add_argument('--work-urls', nargs='*', help='Work servers to send work to
 parser.add_argument('--callbacks',nargs='*', help='Endpoints to forward node callbacks to')
 parser.add_argument('--dpow-url', type=str, help='dPOW HTTP URL', default='https://dpow.nanocenter.org/service/')
 parser.add_argument('--dpow-ws-url', type=str, help='dPOW Web Socket URL', default='wss://dpow.nanocenter.org/service_ws/')
-parser.add_argument('--precache', action='store_true', help='Enables work precaching if specified (does not apply to dPOW)', default=False)
+parser.add_argument('--bpow-url', type=str, help='BoomPow (bPow) HTTP URL', default='https://bpow.banano.cc/service/')
+parser.add_argument('--bpow-ws-url', type=str, help='BoomPow (bPow) Web Socket URL', default='wss://bpow.banano.cc/service_ws/')
+parser.add_argument('--bpow-nano-difficulty', action='store_true', help='Use NANO difficulty with BoomPow (If using for NANO instead of BANANO)', default=False)
+parser.add_argument('--precache', action='store_true', help='Enables work precaching if specified (does not apply to dPOW or bPow)', default=False)
 parser.add_argument('--debug', action='store_true', help='Runs in debug mode if specified', default=False)
 options = parser.parse_args()
 
 # Callback forwarding
-CALLBACK_FORWARDS = options.callbacks
+CALLBACK_FORWARDS = options.callbacks if options.callbacks is not None else []
 
 # Work URLs
 WORK_URLS = options.work_urls if options.work_urls is not None else []
@@ -67,6 +70,28 @@ DPOW_WS_URL = options.dpow_ws_url
 DPOW_USER = os.getenv('DPOW_USER', None)
 DPOW_KEY = os.getenv('DPOW_KEY', None)
 DPOW_ENABLED = DPOW_USER is not None and DPOW_KEY is not None
+
+# For Banano's BoomPow
+BPOW_URL = options.bpow_url
+BPOW_WS_URL = options.bpow_ws_url
+BPOW_USER = os.getenv('BPOW_USER', None)
+BPOW_KEY = os.getenv('BPOW_KEY', None)
+BPOW_ENABLED = BPOW_USER is not None and BPOW_KEY is not None
+BPOW_FOR_NANO = options.bpow_nano_difficulty
+
+async def init_dpow(app):
+    if DPOW_ENABLED:
+        app['dpow'] = DPOWClient(DPOW_WS_URL, DPOW_USER, DPOW_KEY, app)
+        app.loop.create_task(app['dpow'].open_connection())
+    else:
+        app['dpow'] = None
+
+async def init_bpow(app):
+    if BPOW_ENABLED:
+        app['bpow'] = DPOWClient(BPOW_WS_URL, BPOW_USER, BPOW_KEY, app, force_nano_difficulty=BPOW_FOR_NANO)
+        app.loop.create_task(app['bpow'].open_connection())
+    else:
+        app['bpow'] = None
 
 DEBUG = options.debug
 
@@ -101,27 +126,57 @@ async def work_cancel(hash):
     for t in tasks:
         asyncio.ensure_future(t)
 
-async def get_work(app, dpow_id : int):
+async def get_work(app, dpow_id : int, bpow : bool = False):
     msg = None
     with await app['redis'] as redis:
-        msg = await redis.blpop(f'dpow_{dpow_id}', timeout=30)
+        msg = await redis.blpop(f'{"b" if bpow else "d"}pow_{dpow_id}', timeout=30)
     return msg
 
-async def work_generate(hash, app, precache=False):
+async def work_generate(hash, app, precache=False, difficulty=None):
     """RPC work_generate"""
     redis = app['redis']
     request = {"action":"work_generate", "hash":hash}
+    if difficulty is not None:
+        request['difficulty'] = difficulty
     tasks = []
-    dpow_id = -1
     for p in WORK_URLS:
-        tasks.append(json_post(p, request, app=app))
+        tasks.append(json_post(p, request, app=app))                                
+    dpow_id = -1
     if DPOW_ENABLED and not precache:
         dpow_id = await app['dpow'].get_id()
         try:
-            success = await app['dpow'].request_work(hash, dpow_id)
+            success = await app['dpow'].request_work(hash, dpow_id, difficulty=difficulty)
             tasks.append(get_work(app, dpow_id))
         except ConnectionClosed:
-            app.loop.create_task(app['dpow'].open_connection())
+            await init_dpow(app)
+            # HTTP fallback for this request
+            dp_req = {
+                "user": DPOW_USER,
+                "api_key": DPOW_KEY,
+                "hash": hash,
+            }
+            if difficulty is not None:
+                dp_req['difficulty'] = difficulty
+            tasks.append(json_post(DPOW_URL, dp_req, app=app))
+    bpow_id = -1
+    if BPOW_ENABLED and not precache:
+        bpow_id = await app['bpow'].get_id()
+        try:
+            success = await app['bpow'].request_work(hash, bpow_id, difficulty=difficulty)
+            tasks.append(get_work(app, bpow_id))
+        except ConnectionClosed:
+            await init_bpow(app)
+            # HTTP fallback for this request
+            dp_req = {
+                "user": BPOW_USER,
+                "api_key": BPOW_KEY,
+                "hash": hash,
+            }
+            if difficulty is not None:
+                dp_req['difficulty'] = difficulty
+            elif BPOW_FOR_NANO:
+                dp_req['difficulty'] = DPOWClient.NANO_DIFFICULTY_CONST
+            tasks.append(json_post(BPOW_URL, dp_req, app=app))
 
     if NODE_FALLBACK and app['failover']:
         # Failover to the node since we have some requests that are failing
@@ -144,7 +199,7 @@ async def work_generate(hash, app, precache=False):
                     continue
                 if 'work' in result:
                     asyncio.ensure_future(work_cancel(hash))
-                    await redis.set(hash, result['work'], expire=600000) # Cache work
+                    await redis.set(f"{hash}:{difficulty}" if difficulty is not None else hash, result['work'], expire=600000) # Cache work
                     return result
                 elif 'error' in result:
                     log.server_logger.info(f'task returned error {result["error"]}')
@@ -188,15 +243,16 @@ async def rpc(request):
     elif 'hash' not in requestjson:
         return web.HTTPBadRequest(reason='Missing hash in request')
 
+    difficulty = requestjson['difficulty'] if 'difficulty' in requestjson else None
     # See if work is in cache
-    work = await request.app['redis'].get(requestjson['hash'])
+    work = await request.app['redis'].get(f"{requestjson['hash']}:{difficulty}" if difficulty is not None else requestjson['hash'])
     if work is not None:
         return web.json_response({"work":work})
 
     # Not in cache, request it from peers
     try:
         request.app['busy'] = True # Halts the precaching process
-        respjson = await work_generate(requestjson['hash'], request.app)
+        respjson = await work_generate(requestjson['hash'], request.app, difficulty=difficulty)
         if respjson is None:
             request.app['busy'] = False
             return web.HTTPInternalServerError(reason="Couldn't generate work")
@@ -244,13 +300,6 @@ async def get_app():
         app['redis'] = await aioredis.create_redis_pool(('localhost', 6379),
                                                 db=1, encoding='utf-8', minsize=2, maxsize=50)
 
-    async def init_dpow(app):
-        if DPOW_ENABLED:
-            app['dpow'] = DPOWClient(DPOW_WS_URL, DPOW_USER, DPOW_KEY, app)
-            app.loop.create_task(app['dpow'].open_connection())
-        else:
-            app['dpow'] = None
-
     async def init_queue(app):
         """Initialize task queue"""
         app['precache_task'] = app.loop.create_task(precache_queue_process(app))
@@ -278,6 +327,7 @@ async def get_app():
     app.on_startup.append(open_redis)
     app.on_startup.append(init_queue)
     app.on_startup.append(init_dpow)
+    app.on_startup.append(init_bpow)
     app.on_cleanup.append(clear_queue)
     app.on_shutdown.append(close_redis)
 

@@ -8,13 +8,16 @@ class ConnectionClosed(Exception):
     pass
 
 class DPOWClient():
-    def __init__(self, dpow_url : str, user : str, key : str, app : web.Application):
+    NANO_DIFFICULTY_CONST = 'ffffffc000000000'
+
+    def __init__(self, dpow_url : str, user : str, key : str, app : web.Application, force_nano_difficulty: bool = False):
         self.dpow_url = dpow_url
         self.user = user
         self.key = key
         self.id = 0
         self.app = app
         self.ws = None # None when socket is closed
+        self.difficulty = DPOWClient.NANO_DIFFICULTY_CONST if force_nano_difficulty else None
 
     async def open_connection(self):
         """Create the websocket connection to dPOW service"""
@@ -43,14 +46,21 @@ class DPOWClient():
         self.id += 1
         return self.id
 
-    async def request_work(self, hash: str, id: int):
+    async def request_work(self, hash: str, id: int, difficulty: str = None):
         """Request work, return ID of the request"""
-        if self.ws is None:
+        try:
+            if self.ws is None or self.ws.closed:
+                raise ConnectionClosed()
+            req = {
+                "user": self.user,
+                "api_key": self.key,
+                "hash": hash,
+                "id": id
+            }
+            if difficulty is not None:
+                req['difficulty'] = difficulty
+            elif self.difficulty is not None:
+                req['difficulty'] = self.difficulty
+            await self.ws.send_str(json.dumps(req))
+        except Exception:
             raise ConnectionClosed()
-        req = {
-            "user": self.user,
-            "api_key": self.key,
-            "hash": hash,
-            "id": id
-        }
-        await self.ws.send_str(json.dumps(req))

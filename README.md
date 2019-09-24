@@ -64,6 +64,21 @@ DPOW_KEY=123456
 
 If you put these in a file called `.env`, in the same folder as the main program - these will get loaded automatically and dpow will be enabled as a work peer.
 
+## Setting up with BoomPow (bPow)
+
+You can use betsy with BANANO's PoW service as well (BoomPow). You just need to create environment variables to do so.
+
+```
+BPOW_USER=kalium
+BPOW_KEY=124567
+```
+
+Just add these with your credentials to a file called `.env`
+
+**If you intend to use BoomPow with a NANO service!**
+
+You need to also start betsy with the option `--bpow-nano-difficulty`
+
 ## Setting the node callback to point to betsy
 
 If you want to use precaching or callback forwarding, betsy needs to receive callbacks. You can do this by editing the NanoData/config.json file as follows:
@@ -102,13 +117,11 @@ Description=Betsy - Nano Middleware
 After=network.target
 
 [Service]
-PIDFile=/tmp/betsy.pid
+Type=simple
 User=<your_user>
 WorkingDirectory=/path/to/betsy
 EnvironmentFile=/path/to/betsy/.env
 ExecStart=/path/to/betsy/venv/bin/python main.py --host 127.0.0.1 --port 5555 --work-urls 123.45.67.89:6000/work --callbacks 123.45.67.89/callback --precache
-ExecReload=/bin/kill -s HUP $MAINPID
-ExecStop=/bin/kill -s TERM $MAINPID
 
 [Install]
 WantedBy=multi-user.target
