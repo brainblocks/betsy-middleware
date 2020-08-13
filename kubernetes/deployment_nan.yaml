@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: betsy-nano
+  namespace: betsy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: betsy-nano
+  template:
+    metadata:
+      labels:
+        app: betsy-nano
+    spec:
+      containers:
+      - name: betsy-nano
+        image: bananocoin/betsy:1.0.4
+        command: ["/bin/bash", "-c"]
+        args: ["python main.py --host 0.0.0.0 --port 5555 --callbacks http://graham-nano.graham-nano:11337/callback http://graham-banano.graham-nano:11337/callback http://betsy-natrium.betsy:5555/callback --bpow-nano-difficulty"]
+        ports:
+        - containerPort: 5555
+          name: api
+        env:
+          - name: REDIS_HOST
+            value: redis-0.redis
+          - name: REDIS_DB
+            value: "1"  
+          - name: BPOW_USER
+            valueFrom:
+              secretKeyRef:
+                name: betsy
+                key: bpow_user
+          - name: BPOW_KEY
+            valueFrom:
+              secretKeyRef:
+                name: betsy
+                key: bpow_key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: betsy-nano
+  namespace: betsy
+spec:
+  type: ClusterIP
+  ports:
+  - port: 5555
+    targetPort: 5555
+    name: api
+  selector:
+    app: betsy-nano
